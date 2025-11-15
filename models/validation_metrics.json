@@ -1,0 +1,6 @@
+{
+  "overfitting_gap": 0.07883446488551882,
+  "generalization_gap": 0.04954130172153437,
+  "holdout_accuracy": 0.8737541528239202,
+  "validation_accuracy": 0.9232954545454546
+}
