@@ -1,32 +1,19 @@
-#!/usr/bin/env python3
-"""
-Track Friction Analysis API Server
-FastAPI server for real-time friction heatmap generation.
-"""
-
 import base64
-import io
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
-
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse
+from datetime import datetime
+from pathlib import Path
+
+import joblib
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
 
-from infer import FrictionInference
-
-# Initialize FastAPI app
 app = FastAPI(
     title="Track Friction Analyzer",
-    description="Real-time racing track friction analysis API",
-    version="1.0.0"
+    description="Racing track friction analysis API",
+    version="2.0.0"
 )
 
-# Add CORS middleware for web demos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,203 +22,193 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize inference engine
+# Load model
 try:
-    predictor = FrictionInference()
-    print("✅ Friction inference model loaded successfully")
+    model = joblib.load("models/rf_model_balanced.joblib")
+    encoder = joblib.load("models/label_encoder_balanced.joblib")
+    print("Model loaded: Random Forest 71.6% accuracy")
+    MODEL_LOADED = True
 except Exception as e:
-    print(f"❌ Failed to load model: {e}")
-    predictor = None
+    print(f"Failed to load model: {e}")
+    model = None
+    encoder = None
+    MODEL_LOADED = False
+
+
+def extract_patch_features(patch: np.ndarray) -> np.ndarray:
+    """Extract LBP + texture features from patch"""
+    from skimage import feature
+    
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    lbp = feature.local_binary_pattern(gray, P=8, R=1, method='uniform')
+    lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 10), density=True)
+    
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    sobel_mag = np.sqrt(sobel_x**2 + sobel_y**2)
+    
+    sobel_features = [np.mean(sobel_mag), np.std(sobel_mag)]
+    gray_features = [np.mean(gray), np.std(gray)]
+    
+    lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)
+    lab_features = [
+        np.mean(lab[:,:,0]), np.mean(lab[:,:,1]), np.mean(lab[:,:,2]),
+        np.std(lab[:,:,0]), np.std(lab[:,:,1]), np.std(lab[:,:,2])
+    ]
+    
+    return np.concatenate([lbp_hist, sobel_features, gray_features, lab_features])
+
+
+def analyze_racing_image(image: np.ndarray):
+    """Analyze racing image and generate friction heatmap"""
+    if not MODEL_LOADED:
+        raise HTTPException(status_code=503, detail="Model not available")
+    
+    h, w = image.shape[:2]
+    patch_size = 64
+    patch_stride = 32
+    
+    patch_predictions = []
+    patch_positions = []
+    
+    for y in range(0, h - patch_size + 1, patch_stride):
+        for x in range(0, w - patch_size + 1, patch_stride):
+            patch = image[y:y+patch_size, x:x+patch_size]
+            features = extract_patch_features(patch).reshape(1, -1)
+            prob = model.predict_proba(features)[0]
+            
+            patch_predictions.append(prob)
+            patch_positions.append([x + patch_size//2, y + patch_size//2])
+    
+    patch_predictions = np.array(patch_predictions)
+    patch_positions = np.array(patch_positions)
+    
+    from scipy.interpolate import griddata
+    
+    low_idx = list(encoder.classes_).index('Low')
+    low_scores = patch_predictions[:, low_idx]
+    
+    xi = np.arange(0, w, 1)
+    yi = np.arange(0, h, 1)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+    
+    heatmap = griddata(patch_positions, low_scores, (xi_grid, yi_grid), method='cubic', fill_value=0)
+    heatmap = np.clip(heatmap, 0, 1)
+    
+    # Generate colored overlay with reduced brightness
+    colored_heatmap = np.zeros((*heatmap.shape, 3), dtype=np.float32)
+    
+    # Softer, less bright colors
+    colored_heatmap[heatmap <= 0.3] = [0, 0.7, 0]      # Darker green (safe)
+    colored_heatmap[(heatmap > 0.3) & (heatmap <= 0.7)] = [0.8, 0.8, 0]  # Muted yellow (medium)
+    colored_heatmap[heatmap > 0.7] = [0.9, 0, 0]       # Darker red (dangerous)
+    
+    colored_bgr = (colored_heatmap[:,:,[2,1,0]] * 255).astype(np.uint8)
+    
+    mask = heatmap > 0.1
+    overlay = image.copy()
+    alpha = 0.4  # Reduced opacity from 0.6 to 0.4 for subtler effect
+    overlay[mask] = cv2.addWeighted(image[mask], 1-alpha, colored_bgr[mask], alpha, 0)
+    
+    dangerous_patches = np.sum(low_scores > 0.7)
+    total_patches = len(low_scores)
+    danger_percentage = dangerous_patches / total_patches if total_patches > 0 else 0
+    
+    return {
+        'overlay': overlay,
+        'stats': {
+            'total_patches': total_patches,
+            'dangerous_patches': dangerous_patches,
+            'danger_percentage': danger_percentage,
+            'max_danger_score': float(np.max(low_scores)) if len(low_scores) > 0 else 0
+        }
+    }
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    if predictor is None:
-        return {"status": "error", "message": "Model not loaded"}
-    
     return {
-        "status": "healthy",
-        "version": "1.0.0",
-        "model_loaded": predictor is not None,
+        "status": "healthy" if MODEL_LOADED else "error",
+        "model_loaded": MODEL_LOADED,
+        "model_accuracy": "71.6%" if MODEL_LOADED else "N/A",
         "timestamp": datetime.now().isoformat()
     }
 
 
 @app.post("/analyze-image")
-async def analyze_track_image(
-    image: UploadFile = File(...),
-    camera_id: Optional[str] = Form(None),
-    timestamp: Optional[str] = Form(None)
-):
-    """
-    Analyze track image and return friction heatmap
+async def analyze_image(image: UploadFile = File(...)):
+    """Analyze racing track image and return friction heatmap"""
     
-    Args:
-        image: Racing track image file
-        camera_id: Optional camera identifier for temporal tracking
-        timestamp: Optional timestamp for the image
-    
-    Returns:
-        JSON response with heatmap, grid data, and summary statistics
-    """
-    if predictor is None:
+    if not MODEL_LOADED:
         raise HTTPException(status_code=503, detail="Model not available")
     
-    # Validate image file
     if not image.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
     
     try:
-        # Read image
         image_data = await image.read()
-        
-        # Convert to OpenCV format
         nparr = np.frombuffer(image_data, np.uint8)
         cv_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if cv_image is None:
             raise HTTPException(status_code=400, detail="Invalid image format")
         
-        # Generate unique image ID
-        current_time = datetime.now()
-        if timestamp is None:
-            timestamp = current_time.isoformat()
+        h, w = cv_image.shape[:2]
+        if max(h, w) > 1280:
+            scale = 1280 / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            cv_image = cv2.resize(cv_image, (new_w, new_h))
         
-        image_id = f"{camera_id or 'unknown'}_{current_time.strftime('%Y%m%dT%H%M%S')}"
+        result = analyze_racing_image(cv_image)
         
-        # Save temporary image for processing
-        temp_dir = Path("temp")
-        temp_dir.mkdir(exist_ok=True)
-        temp_image_path = temp_dir / f"{image_id}.jpg"
-        cv2.imwrite(str(temp_image_path), cv_image)
+        # Save heatmap as actual image file
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        heatmap_filename = f"heatmap_{timestamp}.jpg"
+        heatmap_path = Path("results/heatmaps") / heatmap_filename
         
-        # Run inference
-        result = predictor.predict_image(str(temp_image_path), save_overlay=True)
+        # Create directory if it doesn't exist
+        heatmap_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Clean up temp file
-        temp_image_path.unlink(missing_ok=True)
+        # Save the heatmap overlay as image file
+        cv2.imwrite(str(heatmap_path), result['overlay'])
         
-        # Convert heatmap to base64 for web transmission
-        overlay_path = result['overlay_path']
-        heatmap_base64 = None
+        # Convert overlay to base64 (for web display)
+        _, buffer = cv2.imencode('.jpg', result['overlay'])
+        heatmap_base64 = base64.b64encode(buffer).decode('utf-8')
         
-        if overlay_path and Path(overlay_path).exists():
-            with open(overlay_path, 'rb') as f:
-                heatmap_base64 = base64.b64encode(f.read()).decode('utf-8')
+        print(f"Heatmap saved to: {heatmap_path}")
         
-        # Build grid response
-        positions = result['patch_positions']
-        scores = result['patch_scores']
-        
-        grid = []
-        for i, (pos, score) in enumerate(zip(positions, scores)):
-            # Determine label based on score
-            if score > 0.7:
-                label = "low"
-                confidence = float(score)
-            elif score > 0.4:
-                label = "medium" 
-                confidence = float(1.0 - abs(score - 0.5) * 2)
-            else:
-                label = "high"
-                confidence = float(1.0 - score)
-            
-            grid.append({
-                "patch_id": f"{image_id}_r{i//20}_c{i%20}",  # Rough grid position
-                "bbox": [
-                    int(pos[0]) - 32, int(pos[1]) - 32,
-                    int(pos[0]) + 32, int(pos[1]) + 32
-                ],
-                "score": float(score),
-                "label": label,
-                "confidence": confidence
-            })
-        
-        # Generate summary
-        summary = result['summary']
-        
-        # Find worst zone
-        if len(scores) > 0:
-            worst_idx = int(np.argmax(scores))
-            worst_zone = f"r{worst_idx//20}_c{worst_idx%20}"
-        else:
-            worst_zone = "none"
-        
-        # Check for persistent zones (placeholder - would need temporal tracking)
-        persistent_zones = []
-        if summary['percent_low_friction'] > 0.5:  # If >50% low friction
-            persistent_zones = [worst_zone]
-        
+        # Build response
         response = {
-            "status": "ok",
-            "image_id": image_id,
-            "timestamp": timestamp,
-            "heatmap_file": overlay_path,
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "image_size": [cv_image.shape[1], cv_image.shape[0]],
             "heatmap_base64": heatmap_base64,
-            "grid": grid,
-            "summary": {
-                "total_patches": int(summary['total_patches']),
-                "low_friction_patches": int(summary['low_friction_patches']),
-                "percent_low": float(summary['percent_low_friction']),
-                "worst_zone": worst_zone,
-                "max_danger_score": float(summary['max_low_score']),
-                "persistent_zones": persistent_zones
+            "heatmap_file_path": str(heatmap_path),
+            "statistics": {
+                "total_patches_analyzed": result['stats']['total_patches'],
+                "dangerous_area_percentage": f"{result['stats']['danger_percentage']:.1%}",
+                "max_danger_score": f"{result['stats']['max_danger_score']:.3f}",
+                "safety_status": "SAFE" if result['stats']['danger_percentage'] < 0.2 else "CAUTION"
+            },
+            "model_info": {
+                "accuracy": "71.6%",
+                "algorithm": "Random Forest"
             }
         }
         
-        print(f"✅ Analyzed image: {image_id}")
-        print(f"   Total patches: {summary['total_patches']}")
-        print(f"   Dangerous areas: {summary['percent_low_friction']:.1%}")
-        
+        print(f"Analyzed image: {cv_image.shape} - {result['stats']['danger_percentage']:.1%} dangerous")
         return response
         
     except Exception as e:
-        print(f"❌ Analysis failed: {e}")
+        print(f"Analysis failed: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-
-@app.get("/fetch-history")
-async def fetch_history(camera_id: str, limit: int = 10):
-    """
-    Fetch recent analysis history for a camera
-    
-    Args:
-        camera_id: Camera identifier
-        limit: Maximum number of recent results to return
-    
-    Returns:
-        List of recent analysis results
-    """
-    # Placeholder implementation - would integrate with database
-    return {
-        "status": "ok",
-        "camera_id": camera_id,
-        "history": [],
-        "message": "History tracking not implemented yet"
-    }
-
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "name": "Track Friction Analysis API",
-        "version": "1.0.0",
-        "status": "running",
-        "endpoints": {
-            "analyze": "/analyze-image (POST)",
-            "history": "/fetch-history (GET)",
-            "health": "/health (GET)"
-        },
-        "model_loaded": predictor is not None
-    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting Track Friction Analysis Server...")
-    print("📊 Model loaded and ready for inference")
-    print("🌐 Access API documentation at: http://localhost:8000/docs")
-    
+    print("Starting Track Friction Analysis API")
+    print("API documentation: http://localhost:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000)

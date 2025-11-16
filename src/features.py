@@ -81,8 +81,22 @@ class FeatureExtractor:
     
     def run(self) -> None:
         """Extract features from all patches"""
+        # Check if patches.csv exists
+        if not self.patch_csv.exists():
+            print(f"Error: {self.patch_csv} not found!")
+            print("Make sure you have run patch extraction first.")
+            return
+            
         # Load patch metadata
-        patches_df = pd.read_csv(self.patch_csv)
+        try:
+            patches_df = pd.read_csv(self.patch_csv)
+        except Exception as e:
+            print(f"Error loading patches CSV: {e}")
+            return
+            
+        if len(patches_df) == 0:
+            print("No patches found in CSV file!")
+            return
         
         print(f"Extracting features from {len(patches_df)} patches...")
         
@@ -90,12 +104,28 @@ class FeatureExtractor:
         features_list = []
         labels_list = []
         ids_list = []
+        valid_patches = 0
         
         for idx, row in tqdm(patches_df.iterrows(), total=len(patches_df), desc="Features"):
-            features = self.extract_patch_features(row['path'])
-            features_list.append(features)
-            labels_list.append(row['label'])
-            ids_list.append(row['patch_id'])
+            patch_path = row['path']
+            
+            # Check if patch file exists
+            if not Path(patch_path).exists():
+                print(f"Warning: Patch file not found: {patch_path}")
+                continue
+                
+            features = self.extract_patch_features(patch_path)
+            
+            # Only add if features are valid (not all zeros)
+            if np.any(features):
+                features_list.append(features)
+                labels_list.append(row['label'])
+                ids_list.append(row['patch_id'])
+                valid_patches += 1
+        
+        if len(features_list) == 0:
+            print("No valid patches found! Check your patch extraction.")
+            return
         
         # Convert to arrays
         X = np.array(features_list)
@@ -124,12 +154,14 @@ class FeatureExtractor:
         print(f"Features saved to {self.output_file}")
         print(f"Feature matrix shape: {X.shape}")
         print(f"Labels shape: {y.shape}")
+        print(f"Valid patches processed: {valid_patches}/{len(patches_df)}")
         
         # Print label distribution
         unique, counts = np.unique(y, return_counts=True)
         print("Label distribution:")
         for label, count in zip(unique, counts):
-            print(f"  {label}: {count}")
+            percentage = (count / len(y)) * 100
+            print(f"  {label}: {count} ({percentage:.1f}%)")
 
 
 def main():

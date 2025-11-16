@@ -30,7 +30,7 @@ class Config:
     
     @property
     def images_dir(self) -> Path:
-        return self.cvat_dir / "images"
+        return Path("data/segmented/segmented")  # Use segmented track images
     
     @property
     def annotations_file(self) -> Path:
@@ -92,6 +92,7 @@ class COCOProcessor:
         """Extract patches from single image"""
         image = cv2.imread(str(image_path))
         if image is None:
+            print(f"Failed to load: {image_path}")
             return []
         
         h, w = image.shape[:2]
@@ -132,24 +133,37 @@ class COCOProcessor:
                         best_label = friction_type
                 
                 if best_label:
-                    # Save patch
-                    patch = image[y:y+self.config.patch_size, x:x+self.config.patch_size]
-                    patch_file = f"{image_path.stem}_patch_{patch_id:04d}.jpg"
-                    patch_path = self.config.output_dir / "images" / patch_file
+                    # Additional validation for segmented images
+                    # Check if patch is mostly track surface (not black background)
+                    patch_rgb = image[y:y+self.config.patch_size, x:x+self.config.patch_size]
                     
-                    cv2.imwrite(str(patch_path), patch)
+                    # Calculate non-black pixel ratio
+                    gray_patch = cv2.cvtColor(patch_rgb, cv2.COLOR_BGR2GRAY)
+                    non_black_pixels = np.sum(gray_patch > 10)  # Not pure black
+                    total_pixels = gray_patch.size
+                    track_ratio = non_black_pixels / total_pixels
                     
-                    patches.append({
-                        'patch_id': f"{image_path.stem}_patch_{patch_id:04d}",
-                        'path': str(patch_path),
-                        'image_id': image_path.stem,
-                        'x1': x, 'y1': y,
-                        'x2': x + self.config.patch_size,
-                        'y2': y + self.config.patch_size,
-                        'label': best_label,
-                        'coverage': best_coverage
-                    })
-                    patch_id += 1
+                    # Only save patches that are mostly track surface
+                    if track_ratio >= 0.7:  # At least 70% track surface
+                        # Save patch
+                        patch = image[y:y+self.config.patch_size, x:x+self.config.patch_size]
+                        patch_file = f"{image_path.stem}_patch_{patch_id:04d}.jpg"
+                        patch_path = self.config.output_dir / "images" / patch_file
+                        
+                        cv2.imwrite(str(patch_path), patch)
+                        
+                        patches.append({
+                            'patch_id': f"{image_path.stem}_patch_{patch_id:04d}",
+                            'path': str(patch_path),
+                            'image_id': image_path.stem,
+                            'x1': x, 'y1': y,
+                            'x2': x + self.config.patch_size,
+                            'y2': y + self.config.patch_size,
+                            'label': best_label,
+                            'coverage': best_coverage,
+                            'track_ratio': track_ratio
+                        })
+                        patch_id += 1
         
         return patches
     
@@ -164,12 +178,30 @@ class COCOProcessor:
         # Process images
         all_patches = []
         for image_id, image_info in tqdm(images.items(), desc="Processing"):
-            image_path = self.config.images_dir / image_info['file_name']
+            original_name = image_info['file_name']
+            
+            # Convert original COCO filename to segmented filename
+            # Original: "WhatsApp Image 2025-11-15 at 22.31.02_84a17888.jpg"
+            # Segmented: "WhatsApp Image 2025-11-15 at 22.31.02_84a17888_color_segmented.jpg"
+            original_stem = Path(original_name).stem
+            segmented_name = f"{original_stem}_color_segmented.jpg"
+            image_path = self.config.images_dir / segmented_name
+            
+            # Fallback: try preprocessed color version if segmented doesn't exist
+            if not image_path.exists():
+                color_name = f"{original_stem}_color.jpg"
+                image_path = Path("data/preprocessed") / color_name
+                
+            # Final fallback: try original name
+            if not image_path.exists():
+                image_path = Path("data/cvat_coco/images") / original_name
             
             if image_path.exists():
                 image_annotations = [a for a in annotations if a['image_id'] == image_id]
                 patches = self.extract_patches(image_path, image_annotations, categories, image_id)
                 all_patches.extend(patches)
+            else:
+                print(f"Image not found: {original_name} (tried segmented: {segmented_name})")
         
         # Save results
         df = pd.DataFrame(all_patches)
