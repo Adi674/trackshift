@@ -1,0 +1,18 @@
+RACING FRICTION ANALYSIS - CONFUSION MATRIX REPORT
+============================================================
+
+Model Performance Summary:
+Overall Accuracy: 0.707
+
+Per-Class Performance:
+Class           Precision  Recall     F1-Score   Accuracy  
+-----------------------------------------------------------------
+High            0.580      0.630      0.604      0.630     
+Low             0.880      0.726      0.796      0.726     
+Medium          0.500      0.754      0.601      0.754     
+
+Confusion Matrix:
+                High       Low    Medium
+      High        58        17        17
+       Low        32       162        29
+    Medium        10         5        46
